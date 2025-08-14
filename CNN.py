@@ -872,17 +872,14 @@ def evaluate(model, loader):
     return float(np.mean(losses)), out
 
 def main():
-    # 1) При необходимости — сгенерировать данные (или пропусти, если уже сгенерил)
-    need_generate = FORCE_REGENERATE or (not glob(os.path.join(DATA_ROOT, "*.npz")))
-    if need_generate:
-        if FORCE_REGENERATE:
-            # подчистить каталог
-            for f in glob(os.path.join(DATA_ROOT, "*.npz")):
-                os.remove(f)
-        # стартовый run-индекс
+    # 1) Генерация новых данных при необходимости
+    existing = glob(os.path.join(DATA_ROOT, "*.npz"))
+    if FORCE_REGENERATE:
+        for f in existing:
+            os.remove(f)
+        existing = []
+    if NUM_RUNS_TO_GENERATE > 0 or not existing:
         start_run = 0 if not APPEND_MODE else next_run_index(DATA_ROOT)
-
-        # сид: каждый запуск — новый базовый
         SEED0 = int(np.random.randint(0, np.iinfo(np.int32).max))
         build_dataset_from_simulator(NUM_RUNS_TO_GENERATE, start_seed=SEED0, start_run=start_run)
 
@@ -925,7 +922,7 @@ def main():
     ckpt_path = os.path.join(DATA_ROOT, "best_model.pt")
     # --- цикл обучения ---
     print("[main] Старт обучения")
-    for epoch in range(1, EPOCHS+1):
+    for epoch in range(start_epoch, start_epoch + EPOCHS):
         tr_loss, tr_dt = train_one_epoch(model, train_ld, opt)
         if val_ld is not None:
             va_loss, va_m = evaluate(model, val_ld)        
