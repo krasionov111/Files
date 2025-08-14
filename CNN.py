@@ -24,6 +24,23 @@ import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from scipy.ndimage import maximum_filter, gaussian_filter
 import imageio
+import torch
+import torch.nn.functional as F
+import math
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def to_tensor(a):
+    """Convert numpy array to torch tensor on the active device."""
+    if isinstance(a, torch.Tensor):
+        return a.to(DEVICE)
+    return torch.from_numpy(a).to(DEVICE)
+
+def to_numpy(a):
+    """Convert torch tensor to numpy array (detached)."""
+    if isinstance(a, torch.Tensor):
+        return a.detach().cpu().numpy()
+    return a
 
 # ============================ CONFIG ===========================================
 x_factor = 1
@@ -47,9 +64,20 @@ RNG_SEED   = 1
 # ===============================================================================
 
 # -------------------- Центрированные FFT --------------------------------------
-def fft2c(u):  return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(u)))
-def ifft2c(u): return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(u)))
-def wrap2pi(phi): return np.mod(phi, 2*np.pi)
+def fft2c(u):
+    if isinstance(u, torch.Tensor):
+        return torch.fft.fftshift(torch.fft.fft2(torch.fft.ifftshift(u)))
+    return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(u)))
+
+def ifft2c(u):
+    if isinstance(u, torch.Tensor):
+        return torch.fft.fftshift(torch.fft.ifft2(torch.fft.ifftshift(u)))
+    return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(u)))
+
+def wrap2pi(phi):
+    if isinstance(phi, torch.Tensor):
+        return torch.remainder(phi, 2*math.pi)
+    return np.mod(phi, 2*np.pi)
 
 # -------------------- Идеальная целевая решетка -------------------------------
 def grid_centers(N_side, grid_size, pitch):
@@ -78,110 +106,123 @@ def random_positions_anywhere(N_side, M, margin=0, seed=0):
 
 # -------------------- Построение мягкой цели в u-плоскости --------------------
 def build_target_amplitude_from_positions(N_side, positions, weights, sigma_spot):
-    """
-    A_target(y,x) = сумма нормированных гауссиан с амплитудой sqrt(w_k).
-    positions: (M,2) float (y,x).
-    """
-    A = np.zeros((N_side, N_side), dtype=np.float32)
-    rad = int(3*sigma_spot)
-    for (r, c), w in zip(positions, weights):
-        if w <= 0: 
+    """GPU-friendly construction of target amplitude map."""
+    pos_t = positions if isinstance(positions, torch.Tensor) else to_tensor(positions)
+    w_t = weights if isinstance(weights, torch.Tensor) else to_tensor(weights)
+    A = torch.zeros((N_side, N_side), dtype=torch.float32, device=DEVICE)
+    if pos_t.numel() == 0:
+        return A
+    rad = int(3 * sigma_spot)
+    ax = torch.arange(-rad, rad + 1, device=DEVICE, dtype=torch.float32)
+    Y_patch, X_patch = torch.meshgrid(ax, ax, indexing='ij')
+    base_gauss = torch.exp(-(X_patch**2 + Y_patch**2) / (2 * sigma_spot**2))
+    base_gauss /= base_gauss.max() if float(base_gauss.max()) > 0 else 1.0
+    r_floor = torch.floor(pos_t[:, 0]).long()
+    c_floor = torch.floor(pos_t[:, 1]).long()
+    for idx in range(pos_t.shape[0]):
+        if float(w_t[idx]) <= 0:
             continue
-        r0 = int(np.floor(r)) - rad
-        c0 = int(np.floor(c)) - rad
-        r1 = r0 + 2*rad + 1
-        c1 = c0 + 2*rad + 1
-        rr0, rr1 = max(0, r0), min(N_side, r1)
-        cc0, cc1 = max(0, c0), min(N_side, c1)
+        r0 = r_floor[idx] - rad
+        c0 = c_floor[idx] - rad
+        r1 = r0 + base_gauss.shape[0]
+        c1 = c0 + base_gauss.shape[1]
+        rr0, rr1 = max(0, int(r0)), min(N_side, int(r1))
+        cc0, cc1 = max(0, int(c0)), min(N_side, int(c1))
         if rr0 >= rr1 or cc0 >= cc1:
             continue
-        ys = np.arange(rr0, rr1) - r
-        xs = np.arange(cc0, cc1) - c
-        X, Y = np.meshgrid(xs, ys)
-        g = np.exp(-(X**2 + Y**2)/(2*sigma_spot**2)).astype(np.float32)
-        g /= (g.max() if g.max()>0 else 1.0)
-        A[rr0:rr1, cc0:cc1] += np.sqrt(w) * g
-    A /= (A.max() if A.max()>0 else 1.0)
+        pr0 = rr0 - int(r0)
+        pc0 = cc0 - int(c0)
+        pr1 = pr0 + (rr1 - rr0)
+        pc1 = pc0 + (cc1 - cc0)
+        A[rr0:rr1, cc0:cc1] += torch.sqrt(w_t[idx]) * base_gauss[pr0:pr1, pc0:pc1]
+    A /= A.max() if float(A.max()) > 0 else 1.0
     return A
 
 # -------------------- Метрики по ROI вокруг позиций ---------------------------
 def intens_at_positions(I, positions, roi=3):
-    N_side = I.shape[0]
-    vals = []
-    for (r, c) in positions:
-        r0 = max(0, int(np.floor(r))-roi)
-        c0 = max(0, int(np.floor(c))-roi)
-        r1 = min(N_side, r0+2*roi+1)
-        c1 = min(N_side, c0+2*roi+1)
-        vals.append(I[r0:r1, c0:c1].mean())
-    return np.array(vals, dtype=np.float32)
+    """Average intensity in square ROIs around given positions (vectorized)."""
+    I_t = I if isinstance(I, torch.Tensor) else to_tensor(I)
+    pos_t = positions if isinstance(positions, torch.Tensor) else to_tensor(positions)
+    if pos_t.numel() == 0:
+        return torch.zeros(0, device=DEVICE)
+    h, w = I_t.shape
+    r = torch.floor(pos_t[:, 0]).long()
+    c = torch.floor(pos_t[:, 1]).long()
+    padded = F.pad(I_t[None, None], (roi, roi, roi, roi))
+    patches = F.unfold(padded, kernel_size=2*roi + 1)[0]
+    idx = r * w + c
+    return patches[:, idx].mean(dim=0)
 
 def uniformity_metric(I, positions, roi=3):
     v = intens_at_positions(I, positions, roi=roi)
-    m = v.max() if v.size else 1.0
-    v = v / (m if m>0 else 1.0)
+    if v.numel() == 0:
+        return 1.0
+    m = v.max()
+    v = v / (m if float(m)>0 else 1.0)
     vmax, vmin = v.max(), v.min()
-    return 1.0 - (vmax - vmin)/(vmax + vmin + 1e-12)
+    return float(1.0 - (vmax - vmin)/(vmax + vmin + 1e-12))
 
 def efficiency_roi(I, positions, roi=3):
-    N_side = I.shape[0]
-    mask = np.zeros_like(I, dtype=bool)
-    for (r, c) in positions:
-        r0 = max(0, int(np.floor(r))-roi)
-        c0 = max(0, int(np.floor(c))-roi)
-        r1 = min(N_side, r0+2*roi+1)
-        c1 = min(N_side, c0+2*roi+1)
-        mask[r0:r1, c0:c1] = True
-    return float(I[mask].sum() / I.sum())
+    """Fraction of total intensity inside ROIs around positions."""
+    I_t = I if isinstance(I, torch.Tensor) else to_tensor(I)
+    pos_t = positions if isinstance(positions, torch.Tensor) else to_tensor(positions)
+    if pos_t.numel() == 0:
+        return 0.0
+    h, w = I_t.shape
+    r = torch.floor(pos_t[:, 0]).long()
+    c = torch.floor(pos_t[:, 1]).long()
+    padded = F.pad(I_t[None, None], (roi, roi, roi, roi))
+    patches = F.unfold(padded, kernel_size=2*roi + 1)[0]
+    idx = r * w + c
+    roi_sum = patches[:, idx].sum()
+    return float(roi_sum / I_t.sum())
 
 # -------------------- Один WGS-шаг с phase-fix --------------------------------
 def wgs_phase_fixed_one_step(A_slm, positions, w_sites, sigma_spot,
                              iters=20, phase_fix_at=10, alpha=0.5, roi=3,
                              U_init=None, psi_ref_init=None):
-    """
-    Weighted GS + заморозка фазы в u-плоскости после phase_fix_at итераций.
-    Возврат: U_out (SLM комплексное поле), psi_ref_out, w_sites_out, логи.
-    """
-    if U_init is None:
-        U = A_slm * np.exp(1j*np.zeros_like(A_slm))
-    else:
-        U = A_slm * np.exp(1j*np.angle(U_init))
-    psi_ref = None if psi_ref_init is None else psi_ref_init.copy()
+    """Weighted GS with optional phase fixing, accelerated on GPU."""
+    A_slm_t = to_tensor(A_slm).to(torch.float32)
+    pos_t   = positions if isinstance(positions, torch.Tensor) else to_tensor(positions)
+    w_t     = w_sites if isinstance(w_sites, torch.Tensor) else to_tensor(w_sites)
 
-    I_tgt = np.ones_like(w_sites, dtype=np.float32)
+    if U_init is None:
+        U = A_slm_t.to(torch.complex64)
+    else:
+        U_init_t = to_tensor(U_init).to(torch.complex64)
+        U = A_slm_t.to(torch.complex64) * torch.exp(1j*torch.angle(U_init_t))
+
+    psi_ref = None if psi_ref_init is None else to_tensor(psi_ref_init).to(torch.float32).clone()
+
+    I_tgt = torch.ones_like(w_t, device=DEVICE)
     unif_log, eff_log = [], []
 
     for it in range(iters):
         G = fft2c(U)
-        I = (np.abs(G)**2).astype(np.float32)
-        I /= (I.max() if I.max()>0 else 1.0)
+        I = torch.abs(G)**2
+        I = I / (I.max() if float(I.max())>0 else 1.0)
 
-        unif_log.append(uniformity_metric(I, positions, roi=roi))
-        eff_log.append(efficiency_roi(I, positions, roi=roi))
+        unif_log.append(uniformity_metric(I, pos_t, roi=roi))
+        eff_log.append(efficiency_roi(I, pos_t, roi=roi))
 
-        # адаптивные веса по измеренной интенсивности
-        I_meas = intens_at_positions(I, positions, roi=roi)
-        I_meas = np.clip(I_meas, 1e-8, None)
-        w_sites = w_sites * (I_tgt / I_meas)**alpha
-        w_sites /= (w_sites.max() if w_sites.max()>0 else 1.0)
+        I_meas = intens_at_positions(I, pos_t, roi=roi)
+        I_meas = torch.clamp(I_meas, 1e-8)
+        w_t = w_t * (I_tgt / I_meas)**alpha
+        w_t = w_t / (w_t.max() if float(w_t.max())>0 else 1.0)
 
-        # цель в u-плоскости
-        A_tgt = build_target_amplitude_from_positions(A_slm.shape[0], positions, w_sites, sigma_spot)
+        A_tgt = build_target_amplitude_from_positions(A_slm_t.shape[0], pos_t, w_t, sigma_spot)
 
-        # фаза в u-плоскости + phase-fix
-        psi = np.angle(G)
-        if (psi_ref is None) and (it == phase_fix_at):
-            psi_ref = psi.copy()
-        psi_use = psi_ref if (psi_ref is not None) else psi
+        psi = torch.angle(G)
+        if psi_ref is None and it == phase_fix_at:
+            psi_ref = psi.clone()
+        psi_use = psi_ref if psi_ref is not None else psi
 
-        # навязываем модуль и фазу в u-плоскости
-        G = A_tgt * np.exp(1j*psi_use)
+        G = A_tgt * torch.exp(1j*psi_use)
 
-        # обратный ход в SLM и навязывание амплитуды накачки
         U_back = ifft2c(G)
-        U = A_slm * np.exp(1j*np.angle(U_back))
+        U = A_slm_t.to(torch.complex64) * torch.exp(1j*torch.angle(U_back))
 
-    return U, psi_ref, w_sites, np.array(unif_log), np.array(eff_log)
+    return to_numpy(U), to_numpy(psi_ref) if psi_ref is not None else None, to_numpy(w_t), np.array(unif_log), np.array(eff_log)
 
 # -------------------- Детекция пиков (для показа, не обязательно) -------------
 def detect_peaks(I_target, min_dist=3, threshold_rel=0.1):
@@ -197,65 +238,98 @@ def detect_peaks(I_target, min_dist=3, threshold_rel=0.1):
 
 # -------------------- Билинейное кодирование в 1024×1024 ----------------------
 def bilinear_splat_positions(pos_xy_float, out_h=1024, out_w=1024, src_h=4096, src_w=4096, value_per_point=1.0):
-    """
-    A_input: «расплескиваем» каждую позицию в 4 соседних пикселя (билинейные веса).
-    """
-    A = np.zeros((out_h, out_w), dtype=np.float32)
+    """Bilinear scatter of points into a 2D grid (vectorized)."""
+    if len(pos_xy_float) == 0:
+        return np.zeros((out_h, out_w), dtype=np.float32)
+    pos = torch.as_tensor(pos_xy_float, device=DEVICE, dtype=torch.float32)
     sy = (out_h - 1) / (src_h - 1)
     sx = (out_w - 1) / (src_w - 1)
-    for (y, x) in pos_xy_float:
-        uy = y * sy; ux = x * sx
-        i = int(np.floor(uy)); j = int(np.floor(ux))
-        dy = uy - i; dx = ux - j
-        for di in (0, 1):
-            for dj in (0, 1):
-                ii = i + di; jj = j + dj
-                if 0 <= ii < out_h and 0 <= jj < out_w:
-                    w = (1 - dy if di==0 else dy) * (1 - dx if dj==0 else dx)
-                    A[ii, jj] += value_per_point * w
-    return A
+    uy = pos[:, 0] * sy
+    ux = pos[:, 1] * sx
+    i = torch.floor(uy)
+    j = torch.floor(ux)
+    dy = uy - i
+    dx = ux - j
+    i = i.long(); j = j.long()
+    ii = torch.stack([i, i + 1, i, i + 1])
+    jj = torch.stack([j, j, j + 1, j + 1])
+    w = torch.stack([
+        (1 - dy) * (1 - dx),
+        dy * (1 - dx),
+        (1 - dy) * dx,
+        dy * dx,
+    ]) * value_per_point
+    mask = (ii >= 0) & (ii < out_h) & (jj >= 0) & (jj < out_w)
+    grid = torch.zeros(out_h * out_w, device=DEVICE, dtype=torch.float32)
+    for k in range(4):
+        valid = mask[k]
+        if valid.any():
+            idx = ii[k, valid] * out_w + jj[k, valid]
+            grid.scatter_add_(0, idx, w[k, valid])
+    return grid.view(out_h, out_w).cpu().numpy()
 
 def bilinear_sample_phase(phi_map, pos_xy_float):
-    """
-    Выборка фазы в u-плоскости по субпиксельным координатам через билинейную
-    интерполяцию на единичной окружности (интерполируем e^{iφ}, затем arg).
-    """
-    h, w = phi_map.shape
-    phases = []
-    for (y, x) in pos_xy_float:
-        i = int(np.floor(y)); j = int(np.floor(x))
-        dy = y - i; dx = x - j
-        acc = 0+0j
-        for di in (0, 1):
-            for dj in (0, 1):
-                ii = np.clip(i+di, 0, h-1); jj = np.clip(j+dj, 0, w-1)
-                wgt = (1 - dy if di==0 else dy) * (1 - dx if dj==0 else dx)
-                acc += wgt * np.exp(1j * phi_map[ii, jj])
-        phases.append(np.angle(acc))
-    return np.array(phases, dtype=np.float32)
+    """Bilinear sampling of phase via unit-circle interpolation (vectorized)."""
+    if len(pos_xy_float) == 0:
+        return np.zeros(0, dtype=np.float32)
+    phi = torch.as_tensor(phi_map, device=DEVICE, dtype=torch.float32)
+    pos = torch.as_tensor(pos_xy_float, device=DEVICE, dtype=torch.float32)
+    h, w = phi.shape
+    i = torch.floor(pos[:, 0])
+    j = torch.floor(pos[:, 1])
+    dy = pos[:, 0] - i
+    dx = pos[:, 1] - j
+    i = i.long(); j = j.long()
+    ii = torch.stack([i, i + 1, i, i + 1])
+    jj = torch.stack([j, j, j + 1, j + 1])
+    ii = ii.clamp(0, h - 1)
+    jj = jj.clamp(0, w - 1)
+    wts = torch.stack([
+        (1 - dy) * (1 - dx),
+        dy * (1 - dx),
+        (1 - dy) * dx,
+        dy * dx,
+    ])
+    vals = phi[ii, jj]
+    phasor = torch.sum(wts * torch.exp(1j * vals), dim=0)
+    return torch.angle(phasor).cpu().numpy().astype(np.float32)
 
 def accumulate_phi_input(phases_at_points, pos_xy_float, out_h=1024, out_w=1024, src_h=4096, src_w=4096):
-    """
-    φ_input: суммируем комплексные фазоры с билинейными весами в те же 4 пикселя,
-    затем берем arg (где есть вклад).
-    """
-    acc = np.zeros((out_h, out_w), dtype=np.complex64)
+    """Accumulate complex phasors with bilinear weights (vectorized)."""
+    if len(pos_xy_float) == 0:
+        return np.zeros((out_h, out_w), dtype=np.float32)
+    pos = torch.as_tensor(pos_xy_float, device=DEVICE, dtype=torch.float32)
+    phi = torch.as_tensor(phases_at_points, device=DEVICE, dtype=torch.float32)
     sy = (out_h - 1) / (src_h - 1)
     sx = (out_w - 1) / (src_w - 1)
-    for (y, x), phi in zip(pos_xy_float, phases_at_points):
-        uy = y * sy; ux = x * sx
-        i = int(np.floor(uy)); j = int(np.floor(ux))
-        dy = uy - i; dx = ux - j
-        for di in (0, 1):
-            for dj in (0, 1):
-                ii = i + di; jj = j + dj
-                if 0 <= ii < out_h and 0 <= jj < out_w:
-                    w = (1 - dy if di==0 else dy) * (1 - dx if dj==0 else dx)
-                    acc[ii, jj] += w * np.exp(1j*phi)
-    phi_input = np.zeros((out_h, out_w), dtype=np.float32)
-    nz = (np.abs(acc) > 1e-12)
-    phi_input[nz] = np.angle(acc[nz]).astype(np.float32)
-    return phi_input
+    uy = pos[:, 0] * sy
+    ux = pos[:, 1] * sx
+    i = torch.floor(uy)
+    j = torch.floor(ux)
+    dy = uy - i
+    dx = ux - j
+    i = i.long(); j = j.long()
+    ii = torch.stack([i, i + 1, i, i + 1])
+    jj = torch.stack([j, j, j + 1, j + 1])
+    w = torch.stack([
+        (1 - dy) * (1 - dx),
+        dy * (1 - dx),
+        (1 - dy) * dx,
+        dy * dx,
+    ])
+    mask = (ii >= 0) & (ii < out_h) & (jj >= 0) & (jj < out_w)
+    acc = torch.zeros(out_h * out_w, dtype=torch.complex64, device=DEVICE)
+    exp_phi = torch.exp(1j * phi)
+    for k in range(4):
+        valid = mask[k]
+        if valid.any():
+            idx = ii[k, valid] * out_w + jj[k, valid]
+            acc.scatter_add_(0, idx, w[k, valid] * exp_phi[valid])
+    acc = acc.view(out_h, out_w)
+    phi_input = torch.zeros(out_h, out_w, dtype=torch.float32, device=DEVICE)
+    nz = acc.abs() > 1e-12
+    phi_input[nz] = torch.angle(acc[nz])
+    return phi_input.cpu().numpy()
 
 # ====================== Основной конвейер (на N_RUN) ===========================
 def run_all(N_side, grid_size, pitch, sigma_spot, sigma_pump_frac,
@@ -336,7 +410,8 @@ def run_all(N_side, grid_size, pitch, sigma_spot, sigma_pump_frac,
 
     for t in range(num_steps+1):
         pos_t = positions_steps[t]
-        iters = iters_first if t == 0 else iters_next              
+        pos_t_t = torch.from_numpy(pos_t).to(DEVICE)
+        iters = iters_first if t == 0 else iters_next
         phase_fix_at = phase_fix_at_first  if t == 0 else min(phase_fix_at_first , max(1, iters-2))
 
         U_out, psi_ref_out, w_sites, ulog, elog = wgs_phase_fixed_one_step(
@@ -346,51 +421,45 @@ def run_all(N_side, grid_size, pitch, sigma_spot, sigma_pump_frac,
         )
         U_prev = U_out; psi_ref_prev = psi_ref_out
 
-        # u-плоскость: поле, интенсивность, метрики
-        G = fft2c(U_out)
-        I = (np.abs(G)**2).astype(np.float32)
-        I /= (I.max() if I.max()>0 else 1.0)
+        U_tensor = to_tensor(U_out)
+        G = fft2c(U_tensor)
+        I_tensor = torch.abs(G)**2
+        I_tensor = I_tensor / (I_tensor.max() if float(I_tensor.max())>0 else 1.0)
+        I = to_numpy(I_tensor)
 
-        uniformities.append(uniformity_metric(I, pos_t, roi=roi))
-        efficiencies.append(efficiency_roi(I, pos_t, roi=roi))
+        uniformities.append(uniformity_metric(I_tensor, pos_t_t, roi=roi))
+        efficiencies.append(efficiency_roi(I_tensor, pos_t_t, roi=roi))
 
-        # φ на SLM
-        phi_t = wrap2pi(np.angle(U_out)).astype(np.float32)
+        phi_t_tensor = wrap2pi(torch.angle(U_tensor)).to(torch.float32)
+        phi_t = to_numpy(phi_t_tensor)
         holograms_phi.append(phi_t)
 
-        # целевая интенсивность в u-плоскости (для показа/логов)
-        A_tgt = build_target_amplitude_from_positions(N_side, pos_t, w_sites, sigma_spot)
-        target_intens.append((A_tgt**2).astype(np.float32))
+        A_tgt_t = build_target_amplitude_from_positions(N_side, pos_t_t, to_tensor(w_sites), sigma_spot)
+        target_intens.append(to_numpy((A_tgt_t**2).to(torch.float32)))
         image_intens.append(I)
 
-        # (A) Пики из целевой карты (демонстрация; реально pos_t уже известны)
-        coords = detect_peaks(A_tgt**2, min_dist=max(2,sigma_spot), threshold_rel=0.2)
+        coords = detect_peaks(to_numpy(A_tgt_t**2), min_dist=max(2,sigma_spot), threshold_rel=0.2)
         coords_detected.append(coords)
 
-        # (B) Входы CNN (1024×1024):
-        #  A_input — билинейное расплескивание позиций
         A_in = bilinear_splat_positions(pos_t, out_h=1024, out_w=1024,
                                         src_h=N_side, src_w=N_side, value_per_point=1.0)
-        #  φ_input — выборка φ в u-плоскости в позициях + расплескивание фазоров
-        phi_u = np.angle(G).astype(np.float32)
+        phi_u = to_numpy(torch.angle(G).to(torch.float32))
         phases_at_pts = bilinear_sample_phase(phi_u, pos_t)
         Phi_in = accumulate_phi_input(phases_at_pts, pos_t, out_h=1024, out_w=1024,
                                       src_h=N_side, src_w=N_side)
 
-        # (C) Лейблы (1024×1024) из центрального SLM-окна -> FFT
         phi_crop   = phi_t[c0:c1, c0:c1]
         A_slm_crop = A_slm[c0:c1, c0:c1]
         U_crop = A_slm_crop * np.exp(1j*phi_crop)
-        G_lab = fft2c(U_crop)
-        A_lab = np.abs(G_lab).astype(np.float32)
-        A_lab /= (A_lab.max() if A_lab.max()>0 else 1.0)
-        
-        Phi_lab = np.angle(G_lab).astype(np.float32)
+        G_lab = fft2c(to_tensor(U_crop))
+        A_lab_t = torch.abs(G_lab).to(torch.float32)
+        A_lab_t = A_lab_t / (A_lab_t.max() if float(A_lab_t.max())>0 else 1.0)
+        Phi_lab_t = torch.angle(G_lab).to(torch.float32)
 
         A_inputs.append(A_in.astype(np.float32))
         Phi_inputs.append(Phi_in.astype(np.float32))
-        A_labels.append(A_lab)
-        Phi_labels.append(Phi_lab)
+        A_labels.append(to_numpy(A_lab_t))
+        Phi_labels.append(to_numpy(Phi_lab_t))
 
     # --- Диагностика для STEP_SHOW ---
     t = int(np.clip(step_show, 0, num_steps))
