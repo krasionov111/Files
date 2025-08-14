@@ -569,7 +569,8 @@ LR = 2e-4
 WEIGHT_DECAY = 1e-4
 EPOCHS = 40
 NUM_WORKERS = 2
-AMP_MIXED = True                    # автокастинг (ускорит/снизит память)
+# Автокастинг удалён, чтобы исключить зависимость от сторонних библиотек
+# и обеспечить работу на системах без дополнительного GPU-стека.
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ======================================================================================
@@ -835,7 +836,7 @@ def loss_components(pred: torch.Tensor, gt: torch.Tensor, roi: torch.Tensor) -> 
 #                         ОБУЧЕНИЕ / ВАЛИДАЦИЯ
 # ======================================================================================
 
-def train_one_epoch(model, loader, opt, scaler=None):
+def train_one_epoch(model, loader, opt):
     model.train()
     t0 = time.time()
     running = []
@@ -845,18 +846,10 @@ def train_one_epoch(model, loader, opt, scaler=None):
         W = W.to(DEVICE, non_blocking=True)
 
         opt.zero_grad(set_to_none=True)
-        if scaler is not None:
-            with torch.autocast(device_type=DEVICE, dtype=torch.float16):
-                P = model(X)
-                loss, _ = loss_components(P, Y, W)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-        else:
-            P = model(X)
-            loss, _ = loss_components(P, Y, W)
-            loss.backward()
-            opt.step()
+        P = model(X)
+        loss, _ = loss_components(P, Y, W)
+        loss.backward()
+        opt.step()
 
         running.append(loss.item())
         if it % 20 == 0:
@@ -879,17 +872,14 @@ def evaluate(model, loader):
     return float(np.mean(losses)), out
 
 def main():
-    # 1) При необходимости — сгенерировать данные (или пропусти, если уже сгенерил)
-    need_generate = FORCE_REGENERATE or (not glob(os.path.join(DATA_ROOT, "*.npz")))
-    if need_generate:
-        if FORCE_REGENERATE:
-            # подчистить каталог
-            for f in glob(os.path.join(DATA_ROOT, "*.npz")):
-                os.remove(f)
-        # стартовый run-индекс
+    # 1) Генерация новых данных при необходимости
+    existing = glob(os.path.join(DATA_ROOT, "*.npz"))
+    if FORCE_REGENERATE:
+        for f in existing:
+            os.remove(f)
+        existing = []
+    if NUM_RUNS_TO_GENERATE > 0 or not existing:
         start_run = 0 if not APPEND_MODE else next_run_index(DATA_ROOT)
-
-        # сид: каждый запуск — новый базовый
         SEED0 = int(np.random.randint(0, np.iinfo(np.int32).max))
         build_dataset_from_simulator(NUM_RUNS_TO_GENERATE, start_seed=SEED0, start_run=start_run)
 
@@ -912,7 +902,6 @@ def main():
     
     model = CNN_AIModule().to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scaler = torch.amp.GradScaler('cuda') if (AMP_MIXED and DEVICE=='cuda') else None
     
 
     start_epoch = 1
@@ -922,8 +911,6 @@ def main():
         model.load_state_dict(ckpt["state_dict"])
         if "opt_state" in ckpt:
             opt.load_state_dict(ckpt["opt_state"])           # <- важно
-        if scaler is not None and "scaler_state" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state"])     # <- для AMP
         if "epoch" in ckpt:
             start_epoch = int(ckpt["epoch"]) + 1
         if "best_val" in ckpt:
@@ -935,8 +922,8 @@ def main():
     ckpt_path = os.path.join(DATA_ROOT, "best_model.pt")
     # --- цикл обучения ---
     print("[main] Старт обучения")
-    for epoch in range(1, EPOCHS+1):
-        tr_loss, tr_dt = train_one_epoch(model, train_ld, opt, scaler)
+    for epoch in range(start_epoch, start_epoch + EPOCHS):
+        tr_loss, tr_dt = train_one_epoch(model, train_ld, opt)
         if val_ld is not None:
             va_loss, va_m = evaluate(model, val_ld)        
             print(f"[epoch {epoch:03d}] train_loss={tr_loss:.4f} ({tr_dt:.1f}s) | "
@@ -950,7 +937,6 @@ def main():
                 "epoch": epoch,
                 "state_dict": model.state_dict(),
                 "opt_state": opt.state_dict(),
-                "scaler_state": (scaler.state_dict() if scaler is not None else None),
                 "val_loss": va_loss,
                 "val_metrics": va_m,
                 "best_val": best_val, }, os.path.join(DATA_ROOT, "best_model.pt"))
@@ -960,7 +946,6 @@ def main():
                 "epoch": epoch,
                 "state_dict": model.state_dict(),
                 "opt_state": opt.state_dict(),
-                "scaler_state": (scaler.state_dict() if scaler is not None else None),
                 "best_val": best_val,
             }, os.path.join(DATA_ROOT, "last_model.pt"))
     
