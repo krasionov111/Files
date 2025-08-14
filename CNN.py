@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from scipy.ndimage import maximum_filter, gaussian_filter
 import imageio
+import torch
 
 # ============================ CONFIG ===========================================
 x_factor = 1
@@ -47,8 +48,16 @@ RNG_SEED   = 1
 # ===============================================================================
 
 # -------------------- Центрированные FFT --------------------------------------
-def fft2c(u):  return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(u)))
-def ifft2c(u): return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(u)))
+def fft2c(u):
+    if isinstance(u, torch.Tensor):
+        return torch.fft.fftshift(torch.fft.fft2(torch.fft.ifftshift(u)))
+    return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(u)))
+
+
+def ifft2c(u):
+    if isinstance(u, torch.Tensor):
+        return torch.fft.fftshift(torch.fft.ifft2(torch.fft.ifftshift(u)))
+    return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(u)))
 def wrap2pi(phi): return np.mod(phi, 2*np.pi)
 
 # -------------------- Идеальная целевая решетка -------------------------------
@@ -514,7 +523,6 @@ import numpy as np
 from glob import glob
 from typing import Tuple, Dict
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -570,7 +578,11 @@ WEIGHT_DECAY = 1e-4
 EPOCHS = 40
 NUM_WORKERS = 2
 AMP_MIXED = True                    # автокастинг (ускорит/снизит память)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
 # ======================================================================================
 #                   ГЕНЕРАЦИЯ ДАТАСЕТА (из твоего симулятора)
@@ -846,7 +858,7 @@ def train_one_epoch(model, loader, opt, scaler=None):
 
         opt.zero_grad(set_to_none=True)
         if scaler is not None:
-            with torch.autocast(device_type=DEVICE, dtype=torch.float16):
+            with torch.autocast(device_type=DEVICE.type, dtype=torch.float16):
                 P = model(X)
                 loss, _ = loss_components(P, Y, W)
             scaler.scale(loss).backward()
@@ -900,19 +912,21 @@ def main():
     test_ds  = TweezersNPZ(te_files)
 
     train_ld = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                          num_workers=NUM_WORKERS, pin_memory=(DEVICE == "cuda"), persistent_workers=False)
+                          num_workers=NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"), persistent_workers=False)
     val_ld   = DataLoader(val_ds, batch_size=1, shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=(DEVICE == "cuda"), persistent_workers=False)
+                          num_workers=NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"), persistent_workers=False)
     test_ld  = DataLoader(test_ds, batch_size=1, shuffle=False,
-                          num_workers=NUM_WORKERS, pin_memory=(DEVICE == "cuda"), persistent_workers=False)
+                          num_workers=NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"), persistent_workers=False)
 
     # 3) Модель + оптимизатор
     RESUME = True                                    # включить продолжение
     RESUME_PATH = os.path.join(DATA_ROOT, "best_model.pt")  # или last_model.pt
     
     model = CNN_AIModule().to(DEVICE)
+    if DEVICE.type == "cuda" and hasattr(torch, "compile"):
+        model = torch.compile(model)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scaler = torch.amp.GradScaler('cuda') if (AMP_MIXED and DEVICE=='cuda') else None
+    scaler = torch.amp.GradScaler('cuda') if (AMP_MIXED and DEVICE.type == 'cuda') else None
     
 
     start_epoch = 1
